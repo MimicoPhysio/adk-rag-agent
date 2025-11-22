@@ -1,17 +1,34 @@
 import logging
 import uuid
 import os
-from fastapi import FastAPI, Request
+import importlib
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-# Import the robust Runner and Memory Services
+# --- ADK Imports ---
 from google.adk.runners import Runner
-from google.adk.services.session import InMemorySessionService
-from google.adk.services.memory import VertexAiMemoryBankService
+from google.adk.sessions import InMemorySessionService
 from google.genai import types
-from .agent import root_agent
 
-# Initialize logging
+# --- Robust Import for Memory Service ---
+try:
+    from google.adk.memory import VertexAiRagMemoryService
+except ImportError:
+    try:
+        from google.adk.memory.vertex_ai_memory_bank_service import VertexAiMemoryBankService as VertexAiRagMemoryService
+    except ImportError:
+        # Fallback to check generic module structure if specific imports fail
+        try:
+            from google.adk.memory.vertex_ai import VertexAiMemoryService as VertexAiRagMemoryService
+        except ImportError as e:
+            print(f"CRITICAL: Could not find VertexAiMemoryService. Check google-adk[vertexai] installation.")
+            raise e
+
+# --- Internal Imports ---
+from .agent import root_agent
+from .services.audit_ledger import AuditLedger
+
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -20,71 +37,86 @@ app = FastAPI()
 # --- CONFIGURATION ---
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+KEY_RING = "cloud-run-signer-keyring"
+KEY_NAME = "adk-rag-agent-signer"
+APP_NAME = "adk-rag-agent"  # Required by ADK Runner for telemetry
 
-# --- MEMORY ARCHITECTURE SETUP ---
+# --- SERVICE INITIALIZATION ---
 
-# 1. Short-Term Memory (Session)
-# Stores the immediate conversation context in RAM. Fast, but transient.
+# 1. Initialize Secure Audit Ledger (Resilient)
+try:
+    ledger = AuditLedger(
+        project_id=PROJECT_ID,
+        location=LOCATION,
+        key_ring=KEY_RING,
+        key_name=KEY_NAME
+    )
+    logger.info("✅ Secure Audit Ledger initialized.")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Audit Ledger (Check Credentials): {e}")
+    ledger = None
+
+# 2. Initialize Short-Term Memory (Session)
 session_service = InMemorySessionService()
 
-# 2. Long-Term Memory (Vertex AI Memory Bank)
-# Persists facts and user details indefinitely using Vertex AI.
-# Note: This service often requires an existing Agent Engine ID. 
-# If basic init fails, you may need to create an engine first via Vertex AI SDK.
+# 3. Initialize Long-Term Memory (Vertex AI RAG)
+# FIXED: Using 'project' instead of 'project_id' to match library spec
 try:
-    logger.info(f"Initializing Long-Term Memory for project {PROJECT_ID}...")
-    # We attempt to initialize without a specific engine ID, assuming default/auto-create if supported
-    # For strict production, pass 'agent_engine_id' here.
-    memory_service = VertexAiMemoryBankService(
+    logger.info(f"Initializing Vertex AI RAG Memory for project {PROJECT_ID}...")
+    memory_service = VertexAiRagMemoryService(
         project=PROJECT_ID, 
         location=LOCATION
     )
+    logger.info("✅ Vertex AI RAG Memory initialized.")
 except Exception as e:
-    logger.error(f"Failed to initialize Long-Term Memory: {e}")
+    logger.error(f"⚠️ Failed to initialize Long-Term Memory: {e}")
     memory_service = None
 
-# 3. Initialize the Runner
+# 4. Initialize the ADK Runner
+# FIXED: Added required 'app_name' argument
 runner = Runner(
     agent=root_agent,
     session_service=session_service,
-    memory_service=memory_service
+    memory_service=memory_service,
+    app_name=APP_NAME
 )
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    memory_status = "active" if memory_service else "disabled"
     return {
         "status": "running", 
-        "service": "adk-rag-agent", 
-        "memory_bank": memory_status
+        "service": APP_NAME, 
+        "memory_bank": "active" if memory_service else "disabled",
+        "audit_ledger": "active" if ledger else "disabled"
     }
 
 @app.post("/chat")
-async def chat(request: Request):
-    """Endpoint to interact with the real ADK agent."""
+async def chat(request: Request, background_tasks: BackgroundTasks):
+    """Primary Agent Endpoint."""
     try:
         body = await request.json()
         user_input = body.get("prompt") or body.get("message")
-        
-        # --- LOGIC CORRECTION ---
-        # 1. Session ID: Tracks the current conversation window
         session_id = body.get("session_id") or str(uuid.uuid4())
-        
-        # 2. User ID: Critical for Long-Term Memory Bank
-        # Defaults to "default_user" if not provided (e.g. for testing)
         user_id = body.get("user_id") or "default_user"
         
         if not user_input:
             return JSONResponse({"error": "No prompt provided"}, status_code=400)
         
-        logger.info(f"Starting run | User: {user_id} | Session: {session_id}")
+        logger.info(f"▶️ Run | User: {user_id} | Session: {session_id}")
+
+        if ledger:
+            ledger.log_action(
+                action="user_query_received",
+                payload={"prompt": user_input, "session_id": session_id},
+                user_id=user_id
+            )
         
         user_msg = types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
         final_response_text = ""
         
-        # Execute the Agent Loop
-        # CRITICAL: We pass BOTH user_id and session_id to the runner
         async for event in runner.run_async(
             session_id=session_id, 
             user_id=user_id, 
@@ -98,6 +130,13 @@ async def chat(request: Request):
         if not final_response_text:
             final_response_text = "The agent processed the request but returned no text content."
 
+        if ledger:
+            ledger.log_action(
+                action="agent_response_generated",
+                payload={"response_preview": final_response_text[:200], "session_id": session_id},
+                user_id=user_id
+            )
+
         return {
             "response": final_response_text, 
             "agent_name": root_agent.name,
@@ -106,5 +145,7 @@ async def chat(request: Request):
         }
 
     except Exception as e:
-        logger.error(f"Agent Execution Error: {str(e)}")
+        logger.error(f"❌ Agent Execution Error: {str(e)}")
+        if ledger:
+            ledger.log_action(action="agent_error", payload={"error": str(e)}, user_id=user_id)
         return JSONResponse({"error": str(e)}, status_code=500)
