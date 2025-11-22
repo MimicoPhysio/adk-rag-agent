@@ -7,3 +7,7 @@ fastapi
 google-cloud-secret-manager
 uvicorn
 deprecated
+google-cloud-firestore
+google-cloud-kms
+google-cloud-firestore
+google-cloud-kms
