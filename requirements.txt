@@ -2,12 +2,10 @@ google-cloud-aiplatform==1.92.0
 google-cloud-storage==2.19.0
 google-genai==1.14.0
 gitpython==3.1.40
-google-adk>=1.0.0
+google-adk[vertexai]>=1.0.0
 fastapi
-google-cloud-secret-manager
 uvicorn
 deprecated
-google-cloud-firestore
-google-cloud-kms
+google-cloud-secret-manager
 google-cloud-firestore
 google-cloud-kms
