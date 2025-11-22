@@ -123,3 +123,57 @@ If you encounter issues:
 - [Vertex AI RAG Documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/rag-overview)
 - [Google Agent Development Kit (ADK) Documentation](https://github.com/google/agents-framework)
 - [Google Cloud Authentication Guide](https://cloud.google.com/docs/authentication)
+
+## 🔐 Enterprise Security Architecture
+
+This project implements a **Zero-Trust Security Architecture** designed to protect sensitive credentials and data.
+
+### 1. Identity & Access Management (IAM)
+We adhere to the **Secure Intermediary Pattern** to separate duties:
+
+* **Agent Identity (`adk-rag-agent-sa`)**:
+    * **Role**: Untrusted reasoning engine running on Cloud Run.
+    * **Permissions**: Minimal. It has **NO** access to secrets, databases, or external APIs. It can only receive HTTP requests and execute basic logic.
+    * **Access**: The Cloud Run service is deployed with `--no-allow-unauthenticated`, meaning it is private and can only be invoked by authorized users (e.g., admin) or frontend services with the `roles/run.invoker` permission.
+
+* **Tool Identity (`adk-tool-sa`)**:
+    * **Role**: Trusted Secure Intermediary.
+    * **Permissions**: Has `roles/secretmanager.secretAccessor` to retrieve credentials at runtime.
+    * **Workflow**: The Agent calls the Tool code. The Tool code uses this identity to fetch secrets *only* for the duration of the function execution. The Model/Agent never sees the raw secret.
+
+### 2. Binary Authorization & Supply Chain Security
+This service enforces strict software supply chain security using **Google Cloud Binary Authorization**:
+
+* **Attestors**: A dedicated Attestor (`adk-rag-agent-attestor`) verifies container images.
+* **Signing**: Every container image built is cryptographically signed using a **Cloud KMS** asymmetric key (`adk-rag-agent-signer`).
+* **Policy**: The Cloud Run service is deployed with `--binary-authorization=default`, ensuring that only images signed by our trusted Attestor can start. Unsigned or modified images are rejected at deployment time.
+
+### 3. Deployment Workflow
+The deployment process involves a rigorous security pipeline:
+1.  **Build**: Docker image is built for `linux/amd64`.
+2.  **Push**: Image is pushed to Google Artifact Registry.
+3.  **Sign**: The unique image digest is signed by the KMS key, creating an **Attestation**.
+4.  **Deploy**: The service is deployed to Cloud Run with Binary Authorization enabled, which verifies the signature before starting the container.
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+**1. "Container failed to start" / CrashLoopBackOff**
+* **Cause**: Often due to missing Python dependencies in `requirements.txt`.
+* **Specific Fix**: The `google-adk` library depends on the **`deprecated`** package. Ensure `deprecated` is listed in `requirements.txt`.
+* **Debugging**: Run the container locally to see the exact Traceback:
+    ```bash
+    docker run --platform linux/amd64 -p 8080:8080 -e PORT=8080 gcr.io/YOUR_PROJECT/IMAGE:TAG
+    ```
+
+**2. "Cloud Run does not support image ... manifest type"**
+* **Cause**: Building the Docker image on an Apple Silicon (M1/M2/M3) Mac creates an `arm64` image, but Cloud Run requires `amd64`.
+* **Fix**: Force the platform during build:
+    ```bash
+    docker build --platform linux/amd64 -t IMAGE_NAME .
+    ```
+
+**3. "Constraint constraints/run.allowedBinaryAuthorizationPolicies violated"**
+* **Cause**: Organization policy requires Binary Authorization.
+* **Fix**: You must sign the image digest and deploy with the flag `--binary-authorization=default`.
