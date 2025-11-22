@@ -29,20 +29,21 @@ session_service = InMemorySessionService()
 
 # 2. Long-Term Memory (Vertex AI Memory Bank)
 # Persists facts and user details indefinitely using Vertex AI.
-# Note: This requires the Vertex AI Agent Engine API to be enabled.
+# Note: This service often requires an existing Agent Engine ID. 
+# If basic init fails, you may need to create an engine first via Vertex AI SDK.
 try:
     logger.info(f"Initializing Long-Term Memory for project {PROJECT_ID}...")
+    # We attempt to initialize without a specific engine ID, assuming default/auto-create if supported
+    # For strict production, pass 'agent_engine_id' here.
     memory_service = VertexAiMemoryBankService(
         project=PROJECT_ID, 
         location=LOCATION
     )
 except Exception as e:
     logger.error(f"Failed to initialize Long-Term Memory: {e}")
-    # Fallback: If Memory Bank fails (e.g., API not enabled), runs without it
     memory_service = None
 
 # 3. Initialize the Runner
-# The Runner orchestrates the Agent, Short-Term Memory, and Long-Term Memory
 runner = Runner(
     agent=root_agent,
     session_service=session_service,
@@ -65,23 +66,30 @@ async def chat(request: Request):
     try:
         body = await request.json()
         user_input = body.get("prompt") or body.get("message")
-        # Use provided session_id or generate a new one for this request
+        
+        # --- LOGIC CORRECTION ---
+        # 1. Session ID: Tracks the current conversation window
         session_id = body.get("session_id") or str(uuid.uuid4())
+        
+        # 2. User ID: Critical for Long-Term Memory Bank
+        # Defaults to "default_user" if not provided (e.g. for testing)
+        user_id = body.get("user_id") or "default_user"
         
         if not user_input:
             return JSONResponse({"error": "No prompt provided"}, status_code=400)
         
-        logger.info(f"Starting agent run for session {session_id}: {user_input}")
+        logger.info(f"Starting run | User: {user_id} | Session: {session_id}")
         
-        # Create the user message payload for ADK
         user_msg = types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
-        
         final_response_text = ""
         
         # Execute the Agent Loop
-        # The Runner now automatically checks Long-Term Memory for context 
-        # AND updates Short-Term session history.
-        async for event in runner.run_async(session_id=session_id, new_message=user_msg):
+        # CRITICAL: We pass BOTH user_id and session_id to the runner
+        async for event in runner.run_async(
+            session_id=session_id, 
+            user_id=user_id, 
+            new_message=user_msg
+        ):
             if hasattr(event, 'content') and event.content and event.source == "model":
                  for part in event.content.parts:
                      if part.text:
@@ -93,7 +101,8 @@ async def chat(request: Request):
         return {
             "response": final_response_text, 
             "agent_name": root_agent.name,
-            "session_id": session_id
+            "session_id": session_id,
+            "user_id": user_id
         }
 
     except Exception as e:

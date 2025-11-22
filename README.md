@@ -177,3 +177,27 @@ The deployment process involves a rigorous security pipeline:
 **3. "Constraint constraints/run.allowedBinaryAuthorizationPolicies violated"**
 * **Cause**: Organization policy requires Binary Authorization.
 * **Fix**: You must sign the image digest and deploy with the flag `--binary-authorization=default`.
+
+## 🧠 Memory Architecture
+
+This agent utilizes a **Dual Memory System** to provide both conversational context and long-term personalization.
+
+### 1. Short-Term Memory (Session)
+* **Service:** `InMemorySessionService`
+* **Scope:** Bound to the specific `session_id`.
+* **Persistence:** Transient (RAM). Lost when the container restarts.
+* **Function:** Keeps track of the immediate "back-and-forth" of the current conversation.
+
+### 2. Long-Term Memory (Memory Bank)
+* **Service:** `VertexAiMemoryBankService`
+* **Scope:** Bound to the `user_id`.
+* **Persistence:** Permanent (Stored in Google Vertex AI).
+* **Function:** Persists facts, user preferences, and summaries across *different* sessions.
+* **Logic:** The `Runner` automatically queries the Memory Bank based on the `user_id` provided in the request to inject relevant context into the prompt.
+
+### 3. Data Flow
+1.  **Request:** User sends `prompt`, `session_id`, and `user_id`.
+2.  **Runner:** * Loads session history using `session_id`.
+    * Retrieves relevant long-term facts using `user_id`.
+3.  **Inference:** Model generates response using both contexts.
+4.  **Update:** Runner saves new turn to Session and updates Memory Bank with new facts (if any).
